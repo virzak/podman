@@ -2894,6 +2894,13 @@ func (c *Container) update(updateOptions *entities.ContainerUpdateOptions) error
 		if err := json.Unmarshal(resourcesToUpdate, c.config.Spec.Linux.Resources); err != nil {
 			return err
 		}
+		// Rootless with cgroupfs the pids controller is often not delegated.
+		// Lifting a pids limit the container does not have changes nothing,
+		// so do not ask the runtime to set it.
+		if pids := c.config.Spec.Linux.Resources.Pids; pids != nil && pidsUnlimited(pids) && pidsUnlimited(oldResources.Pids) &&
+			rootless.IsRootless() && c.CgroupManager() != config.SystemdCgroupsManager {
+			c.config.Spec.Linux.Resources.Pids = nil
+		}
 		updateOptions.Resources = c.config.Spec.Linux.Resources
 	}
 
@@ -2982,6 +2989,11 @@ func (c *Container) update(updateOptions *entities.ContainerUpdateOptions) error
 
 	logrus.Debugf("updated container %s", c.ID())
 	return nil
+}
+
+// pidsUnlimited reports whether pids sets no limit.
+func pidsUnlimited(pids *spec.LinuxPids) bool {
+	return pids == nil || pids.Limit == nil || *pids.Limit <= 0
 }
 
 func (c *Container) resetHealthCheckTimers(noHealthCheck bool, changedTimer bool, wasEnabledHealthCheck bool, isStartup bool) error {
