@@ -2854,6 +2854,14 @@ func (c *Container) update(updateOptions *entities.ContainerUpdateOptions) error
 	oldRestart := c.config.RestartPolicy
 	oldRetries := c.config.RestartRetries
 	oldRlimits := c.config.Spec.Process.Rlimits
+	oldEnv := c.config.Spec.Process.Env
+	revertConfig := func() {
+		c.config.Spec.Linux.Resources = oldResources
+		c.config.RestartPolicy = oldRestart
+		c.config.RestartRetries = oldRetries
+		c.config.Spec.Process.Rlimits = oldRlimits
+		c.config.Spec.Process.Env = oldEnv
+	}
 
 	if updateOptions.RestartPolicy != nil {
 		if err := define.ValidateRestartPolicy(*updateOptions.RestartPolicy); err != nil {
@@ -2907,11 +2915,16 @@ func (c *Container) update(updateOptions *entities.ContainerUpdateOptions) error
 
 	if err := c.runtime.state.RewriteContainerConfig(c, c.config); err != nil {
 		// Assume DB write failed, revert to old resources block
-		c.config.Spec.Linux.Resources = oldResources
-		c.config.RestartPolicy = oldRestart
-		c.config.RestartRetries = oldRetries
-		c.config.Spec.Process.Rlimits = oldRlimits
+		revertConfig()
 		return err
+	}
+	// From here on the new config is in the database, so a failure must
+	// write the old one back, or the next start applies what failed.
+	rollbackConfig := func() {
+		revertConfig()
+		if err := c.runtime.state.RewriteContainerConfig(c, c.config); err != nil {
+			logrus.Errorf("Reverting container %s config after failed update: %v", c.ID(), err)
+		}
 	}
 
 	if c.ensureState(define.ContainerStateCreated, define.ContainerStateRunning, define.ContainerStatePaused) &&
@@ -2920,8 +2933,15 @@ func (c *Container) update(updateOptions *entities.ContainerUpdateOptions) error
 		// To keep inspect accurate we need to update the on-disk OCI spec.
 		onDiskSpec, err := c.specFromState()
 		if err != nil {
+			rollbackConfig()
 			return fmt.Errorf("retrieving on-disk OCI spec to update: %w", err)
 		}
+		var oldOnDiskResources *spec.LinuxResources
+		if onDiskSpec.Linux != nil {
+			oldOnDiskResources = onDiskSpec.Linux.Resources
+		}
+		oldOnDiskEnv := onDiskSpec.Process.Env
+		oldOnDiskRlimits := onDiskSpec.Process.Rlimits
 		if updateOptions.Resources != nil {
 			if onDiskSpec.Linux == nil {
 				onDiskSpec.Linux = new(spec.Linux)
@@ -2939,6 +2959,23 @@ func (c *Container) update(updateOptions *entities.ContainerUpdateOptions) error
 		}
 
 		if err := c.ociRuntime.UpdateContainer(c, updateOptions.Resources); err != nil {
+			// The runtime rejected the update, so do not keep it in the
+			// config either, or the next start fails the same way.
+			rollbackConfig()
+			if onDiskSpec.Linux != nil {
+				onDiskSpec.Linux.Resources = oldOnDiskResources
+			}
+			onDiskSpec.Process.Env = oldOnDiskEnv
+			onDiskSpec.Process.Rlimits = oldOnDiskRlimits
+			if rerr := c.saveSpec(onDiskSpec); rerr != nil {
+				logrus.Errorf("Reverting container %s OCI spec after failed update: %v", c.ID(), rerr)
+			}
+			// The runtime may have set some values before it failed.
+			if updateOptions.Resources != nil {
+				if rerr := c.ociRuntime.UpdateContainer(c, oldResources); rerr != nil {
+					logrus.Warnf("Container %s may keep part of the failed update until it restarts: %v", c.ID(), rerr)
+				}
+			}
 			return err
 		}
 	}
